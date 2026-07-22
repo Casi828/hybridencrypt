@@ -206,7 +206,7 @@ it presents are reproducible from this repository (see above).
 
 This is a **research prototype**, not an externally audited production system. It has a mature,
 well-tested feature set at its current maturity level, but it has **not** undergone a formal
-external security review or penetration test. Planned future work ("Level 5") includes an HSM/KMS
+external security review or penetration test. Planned future work includes an HSM/KMS
 key backend, key escrow, multi-party (threshold) authorization, multi-factor authentication for
 admin operations, TLS for data in transit, and a formal external penetration test. See
 `CHANGELOG.md` for the full status of open items.
@@ -216,10 +216,7 @@ admin operations, TLS for data in transit, and a formal external penetration tes
 ## Development Transparency
 
 This project was developed with the assistance of AI coding tools. The author directed the
-work and personally reviewed, tested, and documented every change. The structured
-AI-assisted workflow — specifications, constraints, and verification checklists — is
-preserved under `docs/dev/ai-workflow/` for transparency; those files are **not required to
-run the project**.
+work and personally reviewed, tested, and documented every change. 
 
 ---
 
