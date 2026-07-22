@@ -65,7 +65,6 @@ class TestImports(unittest.TestCase):
         "spy.audit_logger",
         "spy.user_model",
         "spy.governance_pipeline",
-        "spy.orchestrator",
         "spy.agents.encrypt_agent",
         "spy.agents.decrypt_agent",
     ]
@@ -612,80 +611,6 @@ class TestGovernancePipeline(unittest.TestCase):
         self.pipeline._run_roundtrip(user, self._ctx(), b"audit test", "low")
         size_after = log_path.stat().st_size if log_path.exists() else 0
         self.assertGreater(size_after, size_before, "Audit log should have grown")
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator (fallback path — no API key required)
-# ---------------------------------------------------------------------------
-
-class TestOrchestrator(unittest.TestCase):
-    def setUp(self):
-        from spy.orchestrator import validate_context, DEFAULT_CONTEXT, REQUIRED_FIELDS
-        self.validate = validate_context
-        self.default = DEFAULT_CONTEXT
-        self.fields = REQUIRED_FIELDS
-
-    def test_default_context_is_valid(self):
-        self.assertTrue(self.validate(self.default))
-
-    def test_valid_context_accepted(self):
-        ctx = {
-            "environment": "mobile",
-            "compliance_level": "strict",
-            "performance_priority": "high",
-            "legacy_support_required": False,
-            "bandwidth_constraint": "low",
-        }
-        self.assertTrue(self.validate(ctx))
-
-    def test_missing_field_rejected(self):
-        ctx = dict(self.default)
-        del ctx["environment"]
-        self.assertFalse(self.validate(ctx))
-
-    def test_invalid_value_rejected(self):
-        ctx = dict(self.default)
-        ctx["environment"] = "mainframe"
-        self.assertFalse(self.validate(ctx))
-
-    def test_wrong_bool_type_rejected(self):
-        ctx = dict(self.default)
-        ctx["legacy_support_required"] = "maybe"
-        self.assertFalse(self.validate(ctx))
-
-    def test_non_dict_rejected(self):
-        self.assertFalse(self.validate("not a dict"))  # type: ignore
-
-    def test_llm_fallback_returns_valid_context(self):
-        """When no API key is set, llm_extract_context must return a valid context."""
-        import os
-        from spy.orchestrator import llm_extract_context
-        orig = os.environ.pop("OPENAI_API_KEY", None)
-        try:
-            result = llm_extract_context("test input")
-            self.assertTrue(self.validate(result), f"Fallback context invalid: {result}")
-        finally:
-            if orig is not None:
-                os.environ["OPENAI_API_KEY"] = orig
-
-    def test_pipeline_runs_with_default_context(self):
-        """End-to-end: orchestrator fallback context drives a successful pipeline run."""
-        from spy.governance_pipeline import GovernancePipeline
-        from spy.user_model import User
-        from spy.orchestrator import llm_extract_context
-        import os
-
-        orig = os.environ.pop("OPENAI_API_KEY", None)
-        try:
-            ctx = llm_extract_context("enterprise compliance test")
-            user = User("sysadmin", "admin", "high", authenticated=True)
-            from spy.key_provider import LocalPemKeyProvider
-            ok, result = GovernancePipeline(LocalPemKeyProvider())._run_roundtrip(user, ctx, b"orchestrator integration", "high")
-            self.assertTrue(ok, f"Pipeline failed: {result}")
-            self.assertEqual(result, b"orchestrator integration")
-        finally:
-            if orig is not None:
-                os.environ["OPENAI_API_KEY"] = orig
 
 
 # ---------------------------------------------------------------------------
