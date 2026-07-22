@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spy"
+version = "0.1.0"
+description = "Policy-driven hybrid encryption system (AES-256-GCM data + RSA/ECC key wrapping) with governance, RBAC, and a tamper-evident audit trail."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Geneve Casimir" }]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "cryptography>=42.0.0",
+    "python-dotenv>=1.0.0",
+    "argon2-cffi>=23.1.0",
+]
+
+[project.optional-dependencies]
+dashboard = ["streamlit>=1.32.0"]
+
+[project.scripts]
+spy-cli = "spy.cli:main"
+spy-gui = "spy.gui:main"
+spy-setup-keys = "spy.setup_keys:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spy*"]
+
+[tool.setuptools.exclude-package-data]
+spy = ["*.pem", "*.fp", "*.enc", "*.sig", "audit_log*", ".env"]
+"*" = ["users.json", "users.json*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "benchmark: performance benchmarks — run with: python -m pytest benchmarks/ -q",
+]

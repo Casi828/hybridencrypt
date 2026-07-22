@@ -1,0 +1,192 @@
+===============================================================================
+ HOW TO USE — Policy-Driven Hybrid Encryption System (spy)
+===============================================================================
+
+A step-by-step guide to install, configure, and run the application.
+For the full project overview see README.md; for design details see thesis.pdf.
+
+Everything below assumes you are working from the project root directory
+(the folder that contains this file, pyproject.toml, and the spy/ package).
+
+-------------------------------------------------------------------------------
+ WHAT YOU NEED FIRST
+-------------------------------------------------------------------------------
+  * Python 3.11 or newer   (check with:  python3 --version)
+  * A terminal / command prompt
+  * openssl                (used once to generate a random key)
+
+
+===============================================================================
+ STEP 1 — INSTALL
+===============================================================================
+Create an isolated environment and install the package.
+
+    python3 -m venv .venv
+    source .venv/bin/activate           (Windows: .venv\Scripts\activate)
+    pip install -e .
+
+This installs the dependencies and three commands: spy-cli, spy-gui,
+spy-setup-keys.
+
+Tip: every command in this guide can be run either as the installed command
+(e.g. "spy-cli") OR as a module (e.g. "python3 -m spy.cli"). Both are identical.
+Use the "python3 -m ..." form if the short commands are not on your PATH.
+
+
+===============================================================================
+ STEP 2 — CONFIGURE (.env)
+===============================================================================
+Copy the template, then open .env in an editor and fill in EVERY required value.
+
+    cp .env.example .env
+
+Required values:
+
+    CRYPTO_KEY_DIR            Absolute path to a folder for your keys
+                              (e.g. /home/you/hybridencrypt/runtime/keys)
+    AUDIT_LOG_PATH            Absolute path for the audit log file
+                              (e.g. /home/you/hybridencrypt/runtime/audit_log.json)
+                              NOTE: must be an ABSOLUTE path — relative is rejected.
+    USERS_HMAC_KEY            Integrity key for the user store. Generate one with:
+                                  openssl rand -hex 32
+                              Paste the 64-character output as the value.
+    RSA_KEY_PASSPHRASE        Passphrase protecting the RSA encryption key
+    RSA_SIGN_KEY_PASSPHRASE   Passphrase protecting the RSA signing key
+    ECC_KEY_PASSPHRASE        Passphrase protecting the ECC encryption key
+    ECC_SIGN_KEY_PASSPHRASE   Passphrase protecting the ECC signing key
+
+Optional values:
+
+    DASHBOARD_SECRET          Only needed if you use the Streamlit dashboard
+    SAFE_FILE_ROOT            Override the workspace folder (default: workspace/)
+    USERS_STORE_PATH          Override the user store (default: runtime/users.json)
+
+IMPORTANT: never share or commit your .env file. It is already git-ignored.
+
+
+===============================================================================
+ STEP 3 — GENERATE THE KEYS (run once)
+===============================================================================
+This creates the four keypairs (RSA + ECC, encryption + signing) and records
+them in the key registry.
+
+    spy-setup-keys                       (or: python3 -m spy.setup_keys)
+
+You should see it print each generated key. It will refuse to run if keys
+already exist, so it is safe to run only once per key directory.
+
+
+===============================================================================
+ STEP 4 — CREATE YOUR ADMIN ACCOUNT (first run only)
+===============================================================================
+A fresh install has NO user accounts, and every command except this one
+requires you to log in. The first "add-user" is a special bootstrap step that
+runs WITHOUT a login and creates your administrator account.
+
+    spy-cli add-user                     (or: python3 -m spy.cli add-user)
+
+You will be prompted for a username and password. Because this is the first
+account, it is automatically created as:
+
+    role = admin,  clearance = high
+
+(Any role/clearance options are ignored on this very first account.)
+
+After this, the user store exists — from now on every command requires login,
+and only a logged-in admin can create more users.
+
+
+===============================================================================
+ STEP 5 — EVERYDAY USE
+===============================================================================
+From now on, running any command will first ask you to log in with the
+username and password you created above.
+
+  Encrypt / decrypt / sign / verify a file:
+
+    spy-cli encrypt        Encrypt a file from the workspace
+    spy-cli decrypt        Decrypt a container back to plaintext
+    spy-cli sign           Create a detached signature
+    spy-cli verify         Verify a signature
+
+  Key management (admin only):
+
+    spy-cli rotate-keys        Rotate the signing keys
+    spy-cli rotate-enc-keys    Rotate the encryption keys
+    spy-cli rewrap             Re-wrap a data key under a new key
+
+  Audit log (auditor / admin):
+
+    spy-cli view-logs          Show the audit history
+    spy-cli verify-chain       Verify the tamper-evident audit chain
+    spy-cli export-logs        Export the audit log
+    spy-cli audit-repair       (admin) Repair audit-log continuity metadata
+
+  Manage users (admin only):
+
+    spy-cli users add
+    spy-cli users list
+    spy-cli users disable       | enable
+    spy-cli users change-role   | change-clearance
+    spy-cli users reset-password
+    spy-cli users delete
+
+  (Remember: any "spy-cli X" above is the same as "python3 -m spy.cli X".)
+
+
+===============================================================================
+ OPTIONAL — GRAPHICAL INTERFACE & DASHBOARD
+===============================================================================
+  Desktop GUI (Encrypt / Decrypt / Sign / Verify with a file picker):
+
+    spy-gui                              (or: python3 -m spy.gui)
+
+  Read-only audit dashboard (requires DASHBOARD_SECRET in .env):
+
+    streamlit run spy/dashboard.py
+
+
+===============================================================================
+ OPTIONAL — RUN THE TESTS
+===============================================================================
+The test suite loads real key material, so complete Steps 2 and 3 first
+(the .env file and spy-setup-keys). Then:
+
+    python -m pytest
+
+You should see all tests pass.
+
+
+===============================================================================
+ QUICK REFERENCE — THE WHOLE FIRST-TIME SETUP
+===============================================================================
+    python3 -m venv .venv && source .venv/bin/activate
+    pip install -e .
+    cp .env.example .env          # then edit .env and fill in all values
+    spy-setup-keys                # generate keys (once)
+    spy-cli add-user              # create your first admin account (bootstrap)
+    spy-cli encrypt               # log in, then start using it
+
+
+===============================================================================
+ TROUBLESHOOTING
+===============================================================================
+  * "command not found: spy-cli"
+        Activate your virtual environment, or use "python3 -m spy.cli" instead.
+
+  * A command keeps asking for a username / "Authentication required"
+        You have not created an account yet — do Step 4 (spy-cli add-user),
+        or you typed the wrong login. The first account is admin/high.
+
+  * "CRYPTO_KEY_DIR ... is not set" or "AUDIT_LOG_PATH ... must be absolute"
+        A required value in .env is missing or is a relative path. Both
+        CRYPTO_KEY_DIR and AUDIT_LOG_PATH must be ABSOLUTE paths. Re-check Step 2.
+
+  * "USERS_HMAC_KEY must be ... 64 hex characters"
+        Regenerate it with:  openssl rand -hex 32   and paste the full output.
+
+  * ImportError / "No module named spy"
+        Run from the project root, and make sure "pip install -e ." succeeded
+        inside the activated virtual environment.
+
+===============================================================================

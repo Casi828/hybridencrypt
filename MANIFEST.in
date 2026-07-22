@@ -1,0 +1,14 @@
+# Exclude all runtime artifacts and secrets from source distributions.
+# These are also blocked by .gitignore; the explicit rules here prevent
+# accidental inclusion when building sdists outside a git working tree.
+prune runtime
+prune keys
+global-exclude *.pem
+global-exclude *.fp
+global-exclude *.enc
+global-exclude *.sig
+exclude .env
+exclude audit_log.json
+exclude audit_log.json.*
+exclude users.json
+exclude runtime/users.json
