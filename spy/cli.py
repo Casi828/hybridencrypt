@@ -24,7 +24,7 @@ import getpass
 import os
 import sys
 
-from .audit_logger import (AuditLogger, AuditLogError, check_chain, scan_audit_chain,
+from .audit_logger import (AuditLogger, AuditLogError, scan_audit_chain,
                            verify_chain, read_logs, export_logs)
 from .file_crypto_engine import (
     FileCryptoError,
