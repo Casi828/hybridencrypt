@@ -3,7 +3,7 @@
 A consolidated record of the project's security hardening, architectural decisions,
 and resolved audit findings. The system reached its **Level 4 maturity milestone —
 a hardened research prototype (616 tests passing)** on 2026-04-28, and closed its last
-open code-level findings in Batch P5 on 2026-07-27 (753 tests passing). It has not
+open code-level findings in Batches P5–P6 on 2026-07-27 (761 tests passing). It has not
 undergone a formal external security review; see "Level 5 Architecture Gaps" below.
 
 > Consolidated from the project's original two-part working log. Entries are kept
@@ -32,6 +32,7 @@ undergone a formal external security review; see "Level 5 Architecture Gaps" bel
 | 2026-04-28 | Batch P3 — documentation corrections | 605 |
 | 2026-04-28 | Batch P4 — audit-repair admin gating; HMAC-key entropy validation | 616 |
 | 2026-07-27 | Batch P5 — open items A8, H-4, S7, S11 closed | 753 |
+| 2026-07-27 | Batch P6 — audit chain verification made rotation-aware | 761 |
 
 ---
 
@@ -216,6 +217,45 @@ And persistent per-account lockout state introduces a disk-write timing differen
 known and unknown usernames — Argon2 timing remains normalized, but full timing
 indistinguishability is no longer claimed. A future networked service should key
 rate-limit state independently of user records.
+
+---
+
+### Batch P6 — Audit Chain Verification Made Rotation-Aware (2026-07-27)
+
+Found by running the CLI after Batch P5: `verify-chain` reported
+`Chain broken at line 1: expected previous_hash='GENESIS'` on a log whose chain was
+in fact fully intact. Two defects, one of them security-relevant.
+
+**`check_chain()` was rotation-blind.** It read only the current log file and
+unconditionally required `previous_hash == "GENESIS"` at line 1. But
+`_AuditRotatingFileHandler` deliberately writes an `AUDIT_ROTATION` sentinel as the first
+entry of each new file, linking it to the file it replaced — so after *every* rotation the
+verifier reported a break that did not exist, and rotated history was never verified at
+all. Tamper detection covered only the newest file. Replaced by `verify_chain()`, which
+discovers `audit_log.json.N … .1` plus the current file, walks them oldest-first, and
+carries the running hash across rotation boundaries. `check_chain()` is retained as a
+fail-closed wrapper so `export_logs()` keeps its refuse-to-export-a-tampered-log contract
+(that path was also blocked by the false positive). Two conditions are now *reported*
+rather than misread as tampering: an **epoch restart** (a later file beginning at GENESIS,
+which is what quarantine-and-recover leaves behind) and **truncated history** (the oldest
+surviving file not beginning at GENESIS, because rotation pruned earlier backups). An
+epoch restart is excused only for a literal GENESIS — an arbitrary unknown hash is still a
+hard failure, so a forged sentinel cannot launder a break.
+
+**The CLI conflated two different events.** `_startup_validate()` caught any
+`AuditLogError` and printed *"audit log has corrupt entries — auto-recovery active"*. A
+genuine linkage break — the signature of tampering — produced that same routine-sounding
+message and startup continued. Corrupt-tail auto-recovery and chain verification failure
+are now reported separately: a verification failure prints an explicit
+`*** AUDIT CHAIN VERIFICATION FAILED ***` block stating that this is consistent with
+tampering and is not the same as an interrupted write, and points at `audit-repair`.
+Startup still continues so the operator can investigate. `verify-chain` now prints a
+per-file entry count, any epoch restarts, and the total verified across all files.
+
+Tests: 753 → 761. New coverage for end-to-end verification across rotation, multi-backup
+chronological ordering, detection of tampering **inside a rotated file** (previously
+invisible), epoch restarts being reported but not fatal, a forged non-GENESIS first entry
+still failing, pruned history flagged as truncated, and an absent log as a clean chain.
 
 ---
 

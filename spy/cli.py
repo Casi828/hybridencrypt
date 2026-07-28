@@ -25,7 +25,7 @@ import os
 import sys
 
 from .audit_logger import (AuditLogger, AuditLogError, check_chain, scan_audit_chain,
-                           read_logs, export_logs)
+                           verify_chain, read_logs, export_logs)
 from .file_crypto_engine import (
     FileCryptoError,
     FileCryptoOverwriteError,
@@ -934,9 +934,18 @@ def _cmd_verify_chain(args: argparse.Namespace, user=None) -> int:
 
     try:
         last_valid_hash, corrupt_count = scan_audit_chain()
-        check_chain()
+        report = verify_chain()
     except AuditLogError as exc:
         print(f"Chain integrity FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    # Verification spans the current log and every rotated backup still present;
+    # an AUDIT_ROTATION sentinel links each file to the one it replaced.
+    for path, count in report.files:
+        print(f"  {path.name}: {count} entries")
+
+    if not report.ok:
+        print(f"Chain integrity FAIL: {report.error}", file=sys.stderr)
         if corrupt_count:
             print(f"  {corrupt_count} corrupt entr{'y' if corrupt_count==1 else 'ies'} detected.")
         return 1
@@ -946,8 +955,14 @@ def _cmd_verify_chain(args: argparse.Namespace, user=None) -> int:
         print(f"Last valid hash: {last_valid_hash}")
         return 1
 
-    print("Chain integrity OK — no corrupt entries.")
-    print(f"Last valid hash: {last_valid_hash}")
+    for note in report.epochs:
+        print(f"  Chain restart: {note}")
+    if report.history_truncated:
+        print("  History truncated: earlier entries pruned by rotation.")
+
+    print(f"Chain integrity OK — {report.total_entries} entries verified "
+          f"across {len(report.files)} file{'s' if len(report.files) != 1 else ''}.")
+    print(f"Last valid hash: {report.last_hash}")
     return 0
 
 
@@ -1370,15 +1385,46 @@ def _startup_validate() -> None:
     """
     import os
 
+    # A broken hash chain and an auto-recoverable corrupt tail are different
+    # events and must not share a message: reporting a linkage break as routine
+    # "auto-recovery" would let real tampering read as normal startup noise.
     try:
-        check_chain()
-    except AuditLogError:
-        # Corrupt tail entries are auto-recovered by log_event(). Startup continues.
-        # Run 'spy-cli audit-repair' for a full diagnostic report.
-        print("Warning: audit log has corrupt entries — auto-recovery active.", file=sys.stderr)
+        report = verify_chain()
     except OSError:
         print("Startup error: audit log cannot be read. Cannot proceed.", file=sys.stderr)
         sys.exit(1)
+    except AuditLogError:
+        print("Startup error: audit log cannot be read. Cannot proceed.", file=sys.stderr)
+        sys.exit(1)
+
+    if not report.ok:
+        print("", file=sys.stderr)
+        print("*** AUDIT CHAIN VERIFICATION FAILED ***", file=sys.stderr)
+        print(f"    {report.error}", file=sys.stderr)
+        print("    The audit log does not verify. This is consistent with tampering,", file=sys.stderr)
+        print("    and is NOT the same as a corrupt tail entry from an interrupted write.", file=sys.stderr)
+        print("    Investigate before trusting any audit history:  spy-cli audit-repair", file=sys.stderr)
+        print("", file=sys.stderr)
+    else:
+        # Chain verifies. Surface anything that bounds the guarantee.
+        for note in report.epochs:
+            print(f"Note: audit chain restart — {note}", file=sys.stderr)
+        if report.history_truncated:
+            print(
+                "Note: audit history is truncated — earlier entries were pruned by "
+                "rotation; verification covers only the logs still present.",
+                file=sys.stderr,
+            )
+        try:
+            _, corrupt_count = scan_audit_chain()
+        except AuditLogError:
+            corrupt_count = 0
+        if corrupt_count:
+            print(
+                f"Warning: audit log has {corrupt_count} corrupt "
+                f"entr{'y' if corrupt_count == 1 else 'ies'} — auto-recovery active.",
+                file=sys.stderr,
+            )
 
     try:
         r = KeyRegistry()
