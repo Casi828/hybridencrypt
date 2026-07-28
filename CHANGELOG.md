@@ -2,8 +2,9 @@
 
 A consolidated record of the project's security hardening, architectural decisions,
 and resolved audit findings. The system reached its **Level 4 maturity milestone —
-a hardened research prototype (616 tests passing)** on 2026-04-28. It has not undergone
-a formal external security review; see "Level 5 Architecture Gaps" below.
+a hardened research prototype (616 tests passing)** on 2026-04-28, and closed its last
+open code-level findings in Batches P5–P6 on 2026-07-27 (761 tests passing). It has not
+undergone a formal external security review; see "Level 5 Architecture Gaps" below.
 
 > Consolidated from the project's original two-part working log. Entries are kept
 > where they document a meaningful technical decision, milestone, security fix, or
@@ -30,6 +31,8 @@ a formal external security review; see "Level 5 Architecture Gaps" below.
 | 2026-04-28 | Batch P2 — pipeline decrypt made internal/admin-only; dead params removed | 605 |
 | 2026-04-28 | Batch P3 — documentation corrections | 605 |
 | 2026-04-28 | Batch P4 — audit-repair admin gating; HMAC-key entropy validation | 616 |
+| 2026-07-27 | Batch P5 — open items A8, H-4, S7, S11 closed | 753 |
+| 2026-07-27 | Batch P6 — audit chain verification made rotation-aware | 761 |
 
 ---
 
@@ -146,14 +149,113 @@ is emitted per operation, always attributed to the real user (closes N-B3, A10).
 
 ---
 
-## Open Items (Non-Blocking)
+### Batch P5 — Open Items A8, H-4, S7, S11 Closed (2026-07-27)
 
-| ID | Location | Issue |
-|----|----------|-------|
-| A8 | `spy/auth.py` | Bootstrap TOCTOU race on `store_path.exists()` |
-| H-4 | `spy/auth.py` | No rate limiting / lockout on failed logins |
-| S7 | `spy/file_crypto_engine.py` | `_rewrap_write_header` duplicates the container header format |
-| S11 | `spy/policy_engine.py` | `strict` compliance hardcodes an RSA score bonus (P-256 ECC is equivalent per NIST) |
+The four remaining non-blocking findings are resolved. No open code-level items remain;
+what is left is the Level 5 architecture work below.
+
+**A8 — bootstrap TOCTOU (`spy/auth.py`).** The check-then-create gap is closed by a
+transaction lock covering the *full* read-modify-write cycle, not just bootstrap — two
+admins mutating concurrently could previously both load, mutate, and save, silently
+discarding one update. `_store_transaction()` now wraps `create_user`, `disable_user`,
+`enable_user`, `change_role`, `change_clearance`, `reset_password`, `delete_user`, and
+`authenticate()`'s commit step. The lock file is opened defensively:
+`O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW` → `fstat` regular-file check → unconditional
+`fchmod(fd, 0o600)` → `flock`, with a symlinked runtime directory rejected and every
+failure raising `AuthError`. Authorization under the lock is now **store-backed**:
+`_require_current_admin(admin_user, store)` requires the caller's record to still exist,
+be `active`, and still be `admin` in the freshly reloaded store — the pre-existing
+`_require_admin()` only inspected the cached `User` object, so a disabled, deleted, or
+demoted admin's stale object kept working indefinitely. Argon2 ordering is
+authorize (preliminary) → hash → lock → re-authorize (authoritative) → apply, so hashing
+never runs inside the lock nor before an authorization check.
+
+**H-4 — login rate limiting (`spy/auth.py`).** `failed_attempts` and `locked_until` are
+tracked per record with `LOCKOUT_THRESHOLD = 5` and escalating
+`LOCKOUT_SCHEDULE_SECONDS = (30, 60, 300, 900)`. A correct password during an active lock
+is still denied; success resets both fields; admin `reset_password()` clears them.
+`_lockout_state()` is the single fail-closed parser: a malformed counter or timestamp
+(including `bool`, which subclasses `int`) locks the account indefinitely and is never
+normalized to zero — recovery is an admin action, by design. Argon2 verification runs
+outside the lock against a snapshot, and the result is committed only if the record still
+matches that snapshot under the lock, otherwise the attempt restarts (bounded retry);
+this closes a stale-password race where a concurrent reset could be overtaken by a login
+verified against the old hash. Disabled accounts run the timing-resistant verification but
+are always denied and never have their lockout state mutated.
+
+**S7 — container header duplication (`spy/container_writer.py`, `spy/file_crypto_engine.py`).**
+`_rewrap_write_header()` is deleted. A new pure, stateless, keyword-only
+`build_signed_region()` in `container_writer.py` is the single authority for the SVST
+signed-region layout, shared by `write_header()` and the rewrap path. It owns *all* header
+validation — including the checks the writer constructor used to provide, since rewrap no
+longer constructs a writer at all — plus per-version required-and-forbidden field
+invariants for V1–V4. `sender_pubkey_raw` is now `bytes | None` end to end with no `b""`
+sentinel (RSA requires `None`, ECC non-empty bytes). The rewrap path holds zero references
+to writer-private state. This also closed a latent bug: the old helper appended
+`sign_key_id` whenever the writer had one while forcing the input's version byte, so a V2
+input could have produced a `version=2` container with a V3-shaped payload that the reader
+cannot parse — unreachable in practice only because of an upstream authorization gate, and
+now structurally impossible.
+
+**S11 — policy engine RSA bias (`spy/policy_engine.py`).** The unconditional
+`strict`/`moderate` RSA score bonus is removed; RSA-3072+ and P-256 ECC are equivalent at
+~128-bit classical strength per NIST SP 800-57 Part 1 Rev. 5. `compliance_level` is now
+documented for what it actually does — validated as a recognized policy-context value,
+contributing nothing to RSA-versus-ECC ranking, and *not* validating or enforcing algorithm
+eligibility. Ties (including "no other signal fires") resolve to ECC; this is a stated
+decision, not an accident of the comparison operator.
+
+Tests: 608 → 753 (all passing, plus 71 subtests). New coverage includes process-level
+concurrency tests using real separate OS processes, revoked-admin authorization tests,
+lock-file symlink and permission tests, a test proving unauthorized calls never reach
+Argon2, the full lockout state machine under an injected clock, and a V1–V4 × RSA/ECC
+container wire-format matrix with byte-exact reader re-parse.
+
+**Two trade-offs are documented rather than hidden.** The transaction lock is POSIX-only
+(`flock`); non-POSIX platforms raise `AuthError` at lock time rather than failing at import.
+And persistent per-account lockout state introduces a disk-write timing difference between
+known and unknown usernames — Argon2 timing remains normalized, but full timing
+indistinguishability is no longer claimed. A future networked service should key
+rate-limit state independently of user records.
+
+---
+
+### Batch P6 — Audit Chain Verification Made Rotation-Aware (2026-07-27)
+
+Found by running the CLI after Batch P5: `verify-chain` reported
+`Chain broken at line 1: expected previous_hash='GENESIS'` on a log whose chain was
+in fact fully intact. Two defects, one of them security-relevant.
+
+**`check_chain()` was rotation-blind.** It read only the current log file and
+unconditionally required `previous_hash == "GENESIS"` at line 1. But
+`_AuditRotatingFileHandler` deliberately writes an `AUDIT_ROTATION` sentinel as the first
+entry of each new file, linking it to the file it replaced — so after *every* rotation the
+verifier reported a break that did not exist, and rotated history was never verified at
+all. Tamper detection covered only the newest file. Replaced by `verify_chain()`, which
+discovers `audit_log.json.N … .1` plus the current file, walks them oldest-first, and
+carries the running hash across rotation boundaries. `check_chain()` is retained as a
+fail-closed wrapper so `export_logs()` keeps its refuse-to-export-a-tampered-log contract
+(that path was also blocked by the false positive). Two conditions are now *reported*
+rather than misread as tampering: an **epoch restart** (a later file beginning at GENESIS,
+which is what quarantine-and-recover leaves behind) and **truncated history** (the oldest
+surviving file not beginning at GENESIS, because rotation pruned earlier backups). An
+epoch restart is excused only for a literal GENESIS — an arbitrary unknown hash is still a
+hard failure, so a forged sentinel cannot launder a break.
+
+**The CLI conflated two different events.** `_startup_validate()` caught any
+`AuditLogError` and printed *"audit log has corrupt entries — auto-recovery active"*. A
+genuine linkage break — the signature of tampering — produced that same routine-sounding
+message and startup continued. Corrupt-tail auto-recovery and chain verification failure
+are now reported separately: a verification failure prints an explicit
+`*** AUDIT CHAIN VERIFICATION FAILED ***` block stating that this is consistent with
+tampering and is not the same as an interrupted write, and points at `audit-repair`.
+Startup still continues so the operator can investigate. `verify-chain` now prints a
+per-file entry count, any epoch restarts, and the total verified across all files.
+
+Tests: 753 → 761. New coverage for end-to-end verification across rotation, multi-backup
+chronological ordering, detection of tampering **inside a rotated file** (previously
+invisible), epoch restarts being reported but not fatal, a forged non-GENESIS first entry
+still failing, pruned history flagged as truncated, and an absent log as a clean chain.
 
 ---
 

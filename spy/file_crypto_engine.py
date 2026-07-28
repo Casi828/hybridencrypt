@@ -18,13 +18,18 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .container_reader import StreamingContainerReader, StreamingError
-from .container_writer import ContainerWriterError, StreamingContainerWriter
+from .container_writer import (
+    ContainerWriterError,
+    StreamingContainerWriter,
+    build_signed_region,
+)
 from .crypto_container import (
     KEY_WRAP_ID_ECC,
     KEY_WRAP_ID_RSA,
     SIG_METHOD_ID_ECC,
     SIG_METHOD_ID_RSA,
-    STREAMING_MAGIC,
+    STREAMING_CONTAINER_VERSION_V3,
+    STREAMING_CONTAINER_VERSION_V4,
     is_streaming_container,
 )
 from .crypto_engine import STREAM_CHUNK_SIZE, generate_key
@@ -630,29 +635,61 @@ def rewrap_dek(
             except KeyProviderError:
                 raise FileCryptoError("Decryption denied")
 
+            # The rewritten header must keep the input container's version byte, and
+            # may carry only the fields that version defines — build_signed_region()
+            # rejects any field that does not belong to the declared version.
+            container_version = header.version
+            if container_version is None:
+                raise FileCryptoError("Container version mismatch: rewrap aborted")
+            new_sign_key_id = (
+                rewrap_sign_key_id
+                if container_version in (
+                    STREAMING_CONTAINER_VERSION_V3, STREAMING_CONTAINER_VERSION_V4
+                )
+                else None
+            )
+            new_classification = (
+                header.classification
+                if container_version == STREAMING_CONTAINER_VERSION_V4
+                else None
+            )
+
             # Write new header + original chunk bytes to temp file.
             # Re-use the original base_nonce so all chunk nonces remain valid.
             with tmp_path.open("wb") as out_f:
-                writer = StreamingContainerWriter(
-                    out_file=out_f,
-                    key_wrap_id=key_wrap_id,
-                    sig_method_id=sig_method_id,
-                    wrapped_dek=new_wrapped_dek,
-                    sender_pubkey_raw=sender_pubkey_raw,
-                    sign_private_key=sign_private_key,
-                    aes_key=b"\x00" * 32,  # placeholder — not used for chunk writing
-                    key_id=active_key_id,
-                    sign_key_id=rewrap_sign_key_id,
-                    classification=header.classification,
-                )
-                # Override the random base_nonce with the original to keep chunk nonces valid.
-                writer._base_nonce = header.base_nonce
-                writer._header_written = False
-                # Manually sign and write the header (bypassing write_header's nonce generation).
-                # Returns (signed_region, version) to seed the body digest and verify version invariant.
-                new_signed_region, output_version = _rewrap_write_header(writer, forced_version=header.version)
-                if header.version is not None and output_version != header.version:
+                # Header assembly goes through the shared SVST serializer — no writer
+                # instance and no writer-private state is involved on this path.
+                try:
+                    new_signed_region = build_signed_region(
+                        version=container_version,
+                        key_wrap_id=key_wrap_id,
+                        sig_method_id=sig_method_id,
+                        wrapped_dek=new_wrapped_dek,
+                        sender_pubkey_raw=sender_pubkey_raw,
+                        base_nonce=header.base_nonce,
+                        key_id=active_key_id,
+                        sign_key_id=new_sign_key_id,
+                        classification=new_classification,
+                    )
+                except ContainerWriterError:
+                    raise FileCryptoError("Rewrap denied")
+
+                # Defensive post-condition: the serialized version byte (offset 4,
+                # immediately after the 4-byte magic) must equal the input version.
+                if new_signed_region[4] != container_version:
                     raise FileCryptoError("Container version mismatch: rewrap aborted")
+
+                # Sign and write: signed_region || sig_len (4 BE) || signature.
+                header_sig_method = "rsa" if sig_method_id == SIG_METHOD_ID_RSA else "ecc"
+                try:
+                    header_signature = sign(
+                        header_sig_method, sign_private_key, new_signed_region
+                    )
+                except SignatureError:
+                    raise FileCryptoError("Rewrap denied")
+                out_f.write(new_signed_region)
+                out_f.write(struct.pack(">I", len(header_signature)))
+                out_f.write(header_signature)
 
                 # Copy chunk body bytes only (excluding old trailer) and compute
                 # the new body digest: signed_region + chunk body bytes.
@@ -712,72 +749,6 @@ def rewrap_dek(
             old_dek[:] = bytes(len(old_dek))
 
     return str(output_file)
-
-
-def _rewrap_write_header(writer: "StreamingContainerWriter", forced_version=None) -> tuple:
-    """Write the SVST header using writer's pre-set _base_nonce (for rewrap).
-
-    This is a variant of StreamingContainerWriter.write_header() that skips
-    nonce generation and uses the already-set _base_nonce instead.
-
-    Returns (signed_region_bytes, container_version) so the caller can seed
-    the body digest and verify version invariants.
-    """
-    if writer._header_written:
-        raise ContainerWriterError("_rewrap_write_header called on already-written header")
-
-    wrapped_dek_len = len(writer._wrapped_dek)
-    if wrapped_dek_len > 65535:
-        raise ContainerWriterError(f"wrapped_dek too large: {wrapped_dek_len} bytes")
-
-    from .crypto_container import (
-        STREAMING_CONTAINER_VERSION_V2 as _V2,
-        STREAMING_CONTAINER_VERSION_V3 as _V3,
-        STREAMING_CONTAINER_VERSION_V4 as _V4,
-    )
-    if forced_version is not None:
-        container_version = forced_version
-    elif writer._classification is not None and writer._sign_key_id is not None:
-        container_version = _V4
-    elif writer._sign_key_id is not None:
-        container_version = _V3
-    else:
-        container_version = _V2
-
-    signed_region = (
-        STREAMING_MAGIC
-        + struct.pack(">BBBB", container_version, writer._key_wrap_id, writer._sig_method_id, 0x00)
-        + struct.pack(">H", wrapped_dek_len)
-        + writer._wrapped_dek
-    )
-    if writer._key_wrap_id == KEY_WRAP_ID_ECC:
-        pubkey_len = len(writer._sender_pubkey_raw)
-        signed_region += struct.pack(">H", pubkey_len) + writer._sender_pubkey_raw
-
-    signed_region += writer._base_nonce
-
-    key_id_bytes = writer._key_id.encode("ascii")  # type: ignore[union-attr]
-    signed_region += struct.pack(">H", len(key_id_bytes)) + key_id_bytes
-
-    if writer._sign_key_id is not None:
-        sign_key_id_bytes = writer._sign_key_id.encode("ascii")
-        signed_region += struct.pack(">H", len(sign_key_id_bytes)) + sign_key_id_bytes
-
-    if container_version == _V4:
-        cls_bytes = writer._classification.encode("ascii")  # type: ignore[union-attr]
-        signed_region += struct.pack(">B", len(cls_bytes)) + cls_bytes
-
-    sig_method = "rsa" if writer._sig_method_id == SIG_METHOD_ID_RSA else "ecc"
-    try:
-        signature = sign(sig_method, writer._sign_private_key, signed_region)
-    except SignatureError as exc:
-        raise ContainerWriterError("Header signing failed") from exc
-
-    writer._out.write(signed_region)
-    writer._out.write(struct.pack(">I", len(signature)))
-    writer._out.write(signature)
-    writer._header_written = True
-    return signed_region, container_version
 
 
 def _make_svst_sign_key_resolver(provider: KeyProvider):

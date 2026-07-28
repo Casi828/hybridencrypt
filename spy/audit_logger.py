@@ -35,6 +35,7 @@ import shutil
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import NamedTuple
 
 from . import workspace as _workspace_mod
 
@@ -139,39 +140,82 @@ def _read_last_hash() -> tuple[str, bool]:
     return _GENESIS, True
 
 
-def check_chain() -> None:
-    """Forward chain verification — raises AuditLogError on any linkage or hash violation.
+class ChainReport(NamedTuple):
+    """Structured result of a full cross-file chain verification.
 
-    Iterates entries in write order. For each entry:
-      - Verifies entry["previous_hash"] == expected (prior current_hash, or GENESIS).
-      - Recomputes SHA256(previous_hash || JSON(entry_without_current_hash)) and
-        verifies it matches entry["current_hash"].
-
-    Raises AuditLogError on OS failure, corrupt JSON, broken linkage, or hash mismatch.
-    Intended for spy-audit-repair and the verify-chain CLI command. Does not auto-recover.
+    Attributes:
+        ok: False only for a hard integrity failure (broken linkage, hash
+            mismatch, unparseable entry, unreadable file). Epoch boundaries and
+            truncated history do not clear this flag — they are reported, not
+            treated as tampering.
+        error: Sanitized description of the hard failure, or None when ok.
+        files: (path, entry_count) for every log file inspected, oldest first.
+        total_entries: Number of entries verified across all files.
+        epochs: Human-readable descriptions of legitimate chain restarts — a
+            file that begins at GENESIS because an earlier log was quarantined
+            and a fresh chain was started. Always surfaced to the operator so a
+            restart can never pass unnoticed.
+        history_truncated: True when the oldest available file does not begin at
+            GENESIS, i.e. earlier entries have been pruned by rotation or
+            deleted. Reported because it bounds how far back verification reaches.
+        last_hash: current_hash of the final verified entry, or GENESIS.
     """
-    log_path = _LOG_PATH if _LOG_PATH is not None else _get_audit_log_path()
-    if not log_path.exists() or log_path.stat().st_size == 0:
-        return
+    ok: bool
+    error: "str | None"
+    files: list
+    total_entries: int
+    epochs: list
+    history_truncated: bool
+    last_hash: str
+
+
+def _discover_log_files(base: Path) -> list:
+    """Return existing audit log files oldest-first: base.N … base.1, base.
+
+    RotatingFileHandler names the most recent backup ``.1`` and ages entries to
+    higher numbers, so descending suffix order is chronological. Only files that
+    exist are returned; ``backupCount`` pruning legitimately removes old ones.
+    """
+    backups = []
+    for n in range(_BACKUP_COUNT, 0, -1):
+        candidate = base.with_name(f"{base.name}.{n}")
+        if candidate.exists() and candidate.stat().st_size > 0:
+            backups.append(candidate)
+    if base.exists() and base.stat().st_size > 0:
+        backups.append(base)
+    return backups
+
+
+def _verify_log_file(path: Path, expected: str) -> tuple:
+    """Verify one log file forward from *expected*. Returns (last_hash, count).
+
+    Raises AuditLogError on unreadable file, unparseable entry, missing hash
+    fields, broken linkage, or hash mismatch. The caller decides whether a
+    first-entry linkage mismatch is a hard failure or an epoch boundary, so this
+    function is only ever entered with an *expected* value the caller accepts.
+    """
     try:
-        raw = log_path.read_bytes()
+        raw = path.read_bytes()
     except OSError as exc:
-        raise AuditLogError("Cannot read audit log") from exc
+        raise AuditLogError(f"Cannot read audit log {path.name}") from exc
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    expected = _GENESIS
     for i, line in enumerate(lines):
         try:
             entry = json.loads(line)
         except (json.JSONDecodeError, ValueError):
-            raise AuditLogError(f"Corrupt entry at line {i + 1}: not valid JSON")
+            raise AuditLogError(
+                f"Corrupt entry at {path.name} line {i + 1}: not valid JSON"
+            )
 
         if "previous_hash" not in entry or "current_hash" not in entry:
-            raise AuditLogError(f"Entry at line {i + 1} missing hash fields")
+            raise AuditLogError(
+                f"Entry at {path.name} line {i + 1} missing hash fields"
+            )
 
         if entry["previous_hash"] != expected:
             raise AuditLogError(
-                f"Chain broken at line {i + 1}: "
+                f"Chain broken at {path.name} line {i + 1}: "
                 f"expected previous_hash={expected!r}, got {entry['previous_hash']!r}"
             )
 
@@ -179,11 +223,104 @@ def check_chain() -> None:
         recomputed = _compute_hash(entry["previous_hash"], without_hash)
         if entry["current_hash"] != recomputed:
             raise AuditLogError(
-                f"Hash mismatch at line {i + 1}: "
+                f"Hash mismatch at {path.name} line {i + 1}: "
                 f"stored={entry['current_hash']!r}, computed={recomputed!r}"
             )
 
         expected = entry["current_hash"]
+
+    return expected, len(lines)
+
+
+def verify_chain() -> ChainReport:
+    """Verify the hash chain across the current log and every rotated backup.
+
+    Rotation is part of the chain, not a break in it: ``_AuditRotatingFileHandler``
+    writes an AUDIT_ROTATION sentinel as the first entry of each new file whose
+    previous_hash is the last hash of the file it replaced. Verification therefore
+    walks the files oldest-first and carries the running hash across boundaries.
+    Verifying only the newest file would both report a false break at every
+    rotation and leave all rotated history unverified.
+
+    Two conditions are *reported* rather than treated as tampering:
+      - An epoch boundary: a later file that starts at GENESIS. This is what a
+        documented quarantine-and-restart recovery leaves behind. It is always
+        listed in the report so a restart cannot pass unnoticed.
+      - Truncated history: the oldest available file does not start at GENESIS,
+        because rotation pruned or someone removed earlier backups. This bounds
+        how far back the guarantee reaches and is surfaced for the same reason.
+
+    Returns:
+        A ChainReport. Never raises for an absent or empty log — that is a clean
+        empty chain.
+    """
+    base = _LOG_PATH if _LOG_PATH is not None else _get_audit_log_path()
+    files = _discover_log_files(base)
+    if not files:
+        return ChainReport(True, None, [], 0, [], False, _GENESIS)
+
+    inspected: list = []
+    epochs: list = []
+    total = 0
+    truncated = False
+    expected = _GENESIS
+
+    for index, path in enumerate(files):
+        try:
+            first = json.loads(
+                next(
+                    line
+                    for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if line.strip()
+                )
+            )
+            first_prev = first.get("previous_hash")
+        except (OSError, StopIteration, json.JSONDecodeError, ValueError):
+            first_prev = None  # _verify_log_file will produce the precise error
+
+        if first_prev != expected:
+            if index == 0 and first_prev is not None:
+                # Oldest file we still have does not begin the chain — earlier
+                # history was pruned or removed. Accept it as the starting point
+                # and record that the guarantee does not reach further back.
+                truncated = True
+                expected = first_prev
+            elif first_prev == _GENESIS:
+                # A later file restarting at GENESIS is a chain restart, not a
+                # forgery — it is what quarantine-and-recover leaves behind.
+                epochs.append(
+                    f"{path.name} starts a new chain at GENESIS "
+                    f"(previous chain ended at {expected[:16]}…)"
+                )
+                expected = _GENESIS
+
+        try:
+            expected, count = _verify_log_file(path, expected)
+        except AuditLogError as exc:
+            return ChainReport(
+                False, str(exc), inspected, total, epochs, truncated, expected
+            )
+        inspected.append((path, count))
+        total += count
+
+    return ChainReport(True, None, inspected, total, epochs, truncated, expected)
+
+
+def check_chain() -> None:
+    """Forward chain verification across all log files — raises on any violation.
+
+    Thin fail-closed wrapper over :func:`verify_chain` that preserves this
+    function's original contract for callers that only care whether the chain is
+    sound (notably ``export_logs()``, which must refuse to export a tampered log).
+    Callers that need to *report* epoch boundaries or truncated history should
+    call :func:`verify_chain` directly — those conditions do not raise here.
+
+    Raises AuditLogError on OS failure, corrupt JSON, broken linkage, or hash
+    mismatch. Does not auto-recover.
+    """
+    report = verify_chain()
+    if not report.ok:
+        raise AuditLogError(report.error or "Audit chain verification failed")
 
 
 def scan_audit_chain() -> tuple[str, int]:

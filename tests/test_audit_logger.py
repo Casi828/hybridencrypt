@@ -478,5 +478,156 @@ class TestReadLogsRobustness(unittest.TestCase):
         self.assertEqual(clean[1]["timestamp"], "2026-01-01T00:00:00+00:00")
 
 
+# ---------------------------------------------------------------------------
+# Test: verify_chain() across rotated files
+# ---------------------------------------------------------------------------
+
+class TestVerifyChainAcrossRotation(unittest.TestCase):
+    """Rotation is part of the chain, not a break in it.
+
+    The rotation handler writes an AUDIT_ROTATION sentinel as the first entry of
+    each new file, linking it to the file it replaced. Verifying only the newest
+    file reports a false break at every rotation and leaves rotated history
+    entirely unverified.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._log = Path(self._tmpdir.name) / "audit.json"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _patch(self):
+        return patch.multiple(
+            "spy.audit_logger",
+            _LOG_PATH=self._log,
+            _LOG_FILE=str(self._log),
+        )
+
+    def _backup(self, n: int) -> Path:
+        return self._log.with_name(f"{self._log.name}.{n}")
+
+    def _chain(self, start: str, count: int) -> tuple[list[str], str]:
+        """Build *count* linked entries from *start*. Returns (lines, last_hash)."""
+        lines, prev = [], start
+        for _ in range(count):
+            entry = _make_valid_entry(prev)
+            lines.append(json.dumps(entry))
+            prev = entry["current_hash"]
+        return lines, prev
+
+    def test_rotated_chain_verifies_end_to_end(self):
+        """A chain split across .1 and the current file must verify as one chain."""
+        older, last_older = self._chain("GENESIS", 3)
+        newer, _ = self._chain(last_older, 3)
+        _write_raw_lines(self._backup(1), older)
+        _write_raw_lines(self._log, newer)
+        with self._patch():
+            from spy.audit_logger import verify_chain, check_chain
+            report = verify_chain()
+            self.assertTrue(report.ok, report.error)
+            self.assertEqual(report.total_entries, 6)
+            self.assertEqual([p.name for p, _ in report.files],
+                             ["audit.json.1", "audit.json"])
+            self.assertEqual(report.epochs, [])
+            self.assertFalse(report.history_truncated)
+            check_chain()  # must not raise
+
+    def test_current_file_not_starting_at_genesis_is_not_a_break(self):
+        """The regression: a rotated current file must not be reported as broken.
+
+        Before the fix, check_chain() read only the current file and demanded
+        previous_hash == GENESIS at line 1, so every rotation produced a false
+        'Chain broken at line 1' failure.
+        """
+        older, last_older = self._chain("GENESIS", 2)
+        newer, _ = self._chain(last_older, 2)
+        _write_raw_lines(self._backup(1), older)
+        _write_raw_lines(self._log, newer)
+        with self._patch():
+            from spy.audit_logger import check_chain
+            check_chain()  # must not raise
+
+    def test_multiple_backups_verify_oldest_first(self):
+        """.2 -> .1 -> current must be walked in chronological order."""
+        f2, h2 = self._chain("GENESIS", 2)
+        f1, h1 = self._chain(h2, 2)
+        cur, _ = self._chain(h1, 2)
+        _write_raw_lines(self._backup(2), f2)
+        _write_raw_lines(self._backup(1), f1)
+        _write_raw_lines(self._log, cur)
+        with self._patch():
+            from spy.audit_logger import verify_chain
+            report = verify_chain()
+            self.assertTrue(report.ok, report.error)
+            self.assertEqual(report.total_entries, 6)
+            self.assertEqual([p.name for p, _ in report.files],
+                             ["audit.json.2", "audit.json.1", "audit.json"])
+
+    def test_tampering_in_a_rotated_file_is_detected(self):
+        """Rotated history is now covered — editing an old entry must be caught."""
+        older, last_older = self._chain("GENESIS", 3)
+        newer, _ = self._chain(last_older, 2)
+        tampered = json.loads(older[1])
+        tampered["classification"] = "tampered"
+        older[1] = json.dumps(tampered)
+        _write_raw_lines(self._backup(1), older)
+        _write_raw_lines(self._log, newer)
+        with self._patch():
+            from spy.audit_logger import verify_chain, check_chain, AuditLogError
+            report = verify_chain()
+            self.assertFalse(report.ok)
+            self.assertIn("audit.json.1", report.error)
+            with self.assertRaises(AuditLogError):
+                check_chain()
+
+    def test_epoch_restart_is_reported_not_silently_accepted(self):
+        """A later file restarting at GENESIS is a recovery, but must be surfaced."""
+        older, _ = self._chain("GENESIS", 2)
+        newer, _ = self._chain("GENESIS", 2)  # fresh chain, not linked to older
+        _write_raw_lines(self._backup(1), older)
+        _write_raw_lines(self._log, newer)
+        with self._patch():
+            from spy.audit_logger import verify_chain
+            report = verify_chain()
+            self.assertTrue(report.ok, report.error)
+            self.assertEqual(len(report.epochs), 1)
+            self.assertIn("audit.json", report.epochs[0])
+            self.assertIn("GENESIS", report.epochs[0])
+
+    def test_forged_non_genesis_first_entry_still_fails(self):
+        """An epoch restart is only excused for GENESIS — not an arbitrary hash."""
+        older, _ = self._chain("GENESIS", 2)
+        newer, _ = self._chain("f" * 64, 2)  # links to a hash that does not exist
+        _write_raw_lines(self._backup(1), older)
+        _write_raw_lines(self._log, newer)
+        with self._patch():
+            from spy.audit_logger import verify_chain
+            report = verify_chain()
+            self.assertFalse(report.ok)
+            self.assertIn("Chain broken", report.error)
+
+    def test_pruned_history_is_reported_as_truncated(self):
+        """When the oldest surviving file does not begin at GENESIS, say so."""
+        cur, _ = self._chain("a" * 64, 3)  # earlier backups no longer exist
+        _write_raw_lines(self._log, cur)
+        with self._patch():
+            from spy.audit_logger import verify_chain
+            report = verify_chain()
+            self.assertTrue(report.ok, report.error)
+            self.assertTrue(report.history_truncated)
+            self.assertEqual(report.total_entries, 3)
+
+    def test_absent_log_is_a_clean_empty_chain(self):
+        with self._patch():
+            from spy.audit_logger import verify_chain
+            report = verify_chain()
+            self.assertTrue(report.ok)
+            self.assertEqual(report.total_entries, 0)
+            self.assertEqual(report.files, [])
+            self.assertEqual(report.last_hash, "GENESIS")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,20 @@ def _normalized_bool(value) -> bool:
 def select_encryption_method(context: dict) -> str:
     """Select 'rsa' or 'ecc' based on weighted scoring of deployment context signals.
 
+    Compliance and the RSA/ECC choice are deliberately decoupled. RSA-3072+ and
+    P-256 ECC are both NIST-approved at ~128-bit equivalent strength per NIST
+    SP 800-57 Part 1 Rev. 5, so a stricter compliance level is not a reason to
+    prefer one over the other. "Equivalent strength" here is a statement about
+    classical security bits only — it is not a claim that any given RSA and ECC
+    deployment are interchangeable with respect to certification, cryptographic
+    module validation, or organizational policy.
+
+    `compliance_level` is validated as an accepted policy-context value but does
+    not affect RSA-versus-ECC ranking. This selector assumes both configured
+    algorithms already meet applicable organizational requirements — it does not
+    itself validate or enforce algorithm eligibility. Ties (including "no other
+    signal fires") resolve to ECC.
+
     Args:
         context: Dict with keys: environment, compliance_level, performance_priority,
                  legacy_support_required, bandwidth_constraint.
@@ -71,10 +85,9 @@ def select_encryption_method(context: dict) -> str:
     elif env == "enterprise":
         rsa_score += 2
 
-    if compliance == "strict":
-        rsa_score += 3
-    elif compliance == "moderate":
-        rsa_score += 1
+    # compliance_level intentionally contributes no score to either algorithm —
+    # see the docstring. It is validated above as a recognized policy-context
+    # value and is otherwise not a RSA-versus-ECC ranking signal.
 
     if performance == "high":
         ecc_score += 3
