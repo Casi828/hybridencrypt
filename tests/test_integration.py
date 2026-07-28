@@ -469,7 +469,13 @@ class TestPolicyEngine(unittest.TestCase):
         self.assertIn(result, {"rsa", "ecc"})
 
     def test_legacy_support_favors_rsa(self):
-        result = self.select(self._ctx(legacy_support_required=True, compliance_level="strict"))
+        # Compliance level no longer contributes a score to either algorithm, so the
+        # base context's ECC-favoring signals (cloud, medium perf, medium bandwidth)
+        # must be neutralized for legacy support to be the deciding signal.
+        result = self.select(self._ctx(
+            legacy_support_required=True, compliance_level="strict",
+            performance_priority="low", bandwidth_constraint="high",
+        ))
         self.assertEqual(result, "rsa")
 
     def test_mobile_high_perf_favors_ecc(self):
